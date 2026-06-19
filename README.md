@@ -2,6 +2,8 @@
 
 基于 Nordic nRF52832、DWM3000、NTAG I2C Plus 的 UWB + BLE 双模定位防丢标签固件。
 
+PCB设计待完善 预计7月中旬上传立创开源硬件平台。
+
 当前仓库主要包含 Board A，也就是失物端/标签端。Board A 作为 BLE Peripheral，通过 Nordic UART Service 接收控制命令，并控制 UWB、NFC、蜂鸣器和状态 LED。
 
 ## 当前状态
