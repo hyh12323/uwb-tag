@@ -1,0 +1,31 @@
+# Build outputs
+**/Output/
+**/_build/
+**/*.o
+**/*.d
+**/*.elf
+**/*.hex
+**/*.map
+**/*.bin
+**/*.zip
+
+# Segger Embedded Studio local state
+**/*.emSession
+**/*.jlink
+
+# Local SDK copies must not be committed
+nRF5_SDK_17.1.0_ddde560/
+nRF5_SDK*/
+sdk/
+external_sdk/
+
+# Local editor/system files
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# Local backups
+backups/

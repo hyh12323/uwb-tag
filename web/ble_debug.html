@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CC-UWB-TAG BLE 调试面板</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font:14px/1.6 system-ui,sans-serif;background:#1a1a2e;color:#e0e0e0;max-width:480px;margin:auto;padding:16px}
+h1{font-size:20px;text-align:center;color:#00d4ff;margin-bottom:4px}
+h2{font-size:13px;text-align:center;color:#888;font-weight:400;margin-bottom:14px}
+#status{background:#16213e;border-radius:8px;padding:10px 14px;margin-bottom:12px;text-align:center;font-size:13px;min-height:20px}
+#status.ok{background:#0d3b2a;color:#4ade80}
+#status.err{background:#3b0d0d;color:#f87171}
+#btn-connect,#btn-scan-all{display:block;width:100%;padding:12px;font-size:16px;background:#00d4ff;color:#000;border:none;border-radius:8px;cursor:pointer;font-weight:700;margin-bottom:8px}
+#btn-scan-all{background:#64748b;color:#fff;font-size:13px}
+#btn-connect:active,#btn-scan-all:active,.btn:active{opacity:.75}
+#btn-connect:disabled,.btn:disabled{opacity:.35;cursor:default}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
+.btn{border:none;border-radius:8px;padding:10px 8px;font-size:14px;font-weight:600;cursor:pointer;color:#fff;text-align:center}
+.btn-ping{background:#6366f1}
+.btn-uwb{background:#f59e0b}
+.btn-buzz{background:#ef4444}
+.btn-led{background:#10b981}
+.btn-led2{background:#06b6d4}
+#log{background:#0f0f23;border-radius:8px;padding:10px 14px;height:280px;overflow-y:auto;font:12px/1.5 Consolas,"Courier New",monospace;white-space:pre-wrap;word-break:break-all}
+#log .tx{color:#fbbf24}
+#log .rx{color:#4ade80}
+#log .info{color:#94a3b8}
+#log .err{color:#f87171}
+#log .time{color:#666;margin-right:8px}
+</style>
+</head>
+<body>
+
+<h1>CC-UWB-TAG</h1>
+<h2>Board A BLE 调试面板</h2>
+
+<div id="status">未连接，点击下方按钮扫描</div>
+<button id="btn-connect" onclick="connectFiltered()">🔗 连接 CC-UWB-TAG</button>
+<button id="btn-scan-all" onclick="connectAll()">扫描所有 BLE 设备</button>
+
+<div class="grid">
+  <button class="btn btn-ping" id="btn-ping" disabled onclick="sendCmd([0x01])">↻ PING</button>
+  <button class="btn btn-uwb" id="btn-uwb-s" disabled onclick="sendCmd([0x10])">📡 UWB Start</button>
+  <button class="btn btn-uwb" id="btn-uwb-x" disabled onclick="sendCmd([0x11])">⏹ UWB Stop</button>
+  <button class="btn btn-buzz" id="btn-buzz-on" disabled onclick="sendCmd([0x20])">🔊 Buzzer ON</button>
+  <button class="btn btn-buzz" id="btn-buzz-off" disabled onclick="sendCmd([0x21])">🔇 Buzzer OFF</button>
+  <button class="btn btn-led" id="btn-led1" disabled onclick="sendCmd([0x30,0x01])">💡 LED1 On</button>
+  <button class="btn btn-led" id="btn-led2" disabled onclick="sendCmd([0x30,0x02])">💡 LED2 On</button>
+  <button class="btn btn-led2" id="btn-led0" disabled onclick="sendCmd([0x30,0x00])">🌙 LEDs Off</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+const NUS_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_TX      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const NUS_RX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+let device = null;
+let server = null;
+let rxChar = null;
+let txChar = null;
+let writeBusy = false;
+let reconnecting = false;
+let manualDisconnect = false;
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function now() {
+  const d = new Date();
+  return d.getHours().toString().padStart(2, '0') + ':' +
+         d.getMinutes().toString().padStart(2, '0') + ':' +
+         d.getSeconds().toString().padStart(2, '0');
+}
+
+function logHex(bytes) {
+  return Array.from(bytes).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+}
+
+function log(cls, text) {
+  const el = document.getElementById('log');
+  el.innerHTML += `<span class="${cls}"><span class="time">${now()}</span>${text}</span>\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setPanelConnected(ok) {
+  document.querySelectorAll('.grid .btn').forEach(b => b.disabled = !ok);
+  document.getElementById('btn-connect').disabled = ok;
+  const st = document.getElementById('status');
+  if (ok) {
+    st.className = 'ok';
+    st.textContent = '已连接 ' + (device && device.name ? device.name : '');
+  } else {
+    st.className = 'err';
+    st.textContent = reconnecting ? '已断开，正在自动重连...' : '已断开，点击按钮重新连接';
+    document.getElementById('btn-connect').disabled = false;
+  }
+}
+
+function clearGattOnly() {
+  server = null;
+  rxChar = null;
+  txChar = null;
+  writeBusy = false;
+}
+
+function onNotification(ev) {
+  const bytes = new Uint8Array(ev.target.value.buffer);
+  log('rx', '← ' + logHex(bytes));
+}
+
+function onDisconnected(ev) {
+  const oldDevice = ev && ev.target ? ev.target : device;
+  log('err', 'BLE 断开');
+  clearGattOnly();
+  setPanelConnected(false);
+  if (!manualDisconnect) {
+    autoReconnect(oldDevice);
+  }
+}
+
+async function connectGatt(targetDevice, isReconnect) {
+  if (!targetDevice) {
+    throw new Error('没有可重连的设备对象');
+  }
+
+  device = targetDevice;
+  device.removeEventListener('gattserverdisconnected', onDisconnected);
+  device.addEventListener('gattserverdisconnected', onDisconnected);
+
+  log('info', (isReconnect ? '正在重连 GATT...' : '正在连接 GATT...'));
+  server = await device.gatt.connect();
+  await sleep(300);
+  if (!server.connected) {
+    server = await device.gatt.connect();
+    await sleep(300);
+  }
+
+  const service = await server.getPrimaryService(NUS_SERVICE);
+  txChar = await service.getCharacteristic(NUS_TX);
+  rxChar = await service.getCharacteristic(NUS_RX);
+  await rxChar.startNotifications();
+  rxChar.removeEventListener('characteristicvaluechanged', onNotification);
+  rxChar.addEventListener('characteristicvaluechanged', onNotification);
+
+  reconnecting = false;
+  setPanelConnected(true);
+  log('info', isReconnect ? '自动重连成功' : 'NUS TX/RX Characteristic 就绪');
+  log('info', '=== 已就绪，点击按钮发送指令 ===');
+}
+
+async function autoReconnect(oldDevice) {
+  if (!oldDevice || reconnecting) {
+    return;
+  }
+
+  reconnecting = true;
+  setPanelConnected(false);
+
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    try {
+      await sleep(attempt * 1200);
+      await connectGatt(oldDevice, true);
+      return;
+    } catch (e) {
+      log('err', `自动重连失败 ${attempt}/5: ${e.message}`);
+      clearGattOnly();
+    }
+  }
+
+  reconnecting = false;
+  setPanelConnected(false);
+}
+
+async function connectFiltered() {
+  log('info', '正在扫描 BLE 设备 (筛选名称 "CC-UWB-TAG")...');
+  try {
+    manualDisconnect = false;
+    clearGattOnly();
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'CC-UWB' }],
+      optionalServices: [NUS_SERVICE]
+    });
+    log('info', '发现设备: ' + (device.name || '(no name)'));
+    await connectGatt(device, false);
+  } catch (e) {
+    log('err', '失败: ' + e.message);
+    clearGattOnly();
+    setPanelConnected(false);
+  }
+}
+
+async function connectAll() {
+  log('info', '正在扫描所有附近 BLE 设备...');
+  try {
+    manualDisconnect = false;
+    clearGattOnly();
+    device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices: true,
+      optionalServices: [NUS_SERVICE]
+    });
+    log('info', '选择设备: ' + (device.name || '(no name)'));
+    await connectGatt(device, false);
+  } catch (e) {
+    log('err', '失败: ' + e.message);
+    clearGattOnly();
+    setPanelConnected(false);
+  }
+}
+
+async function sendCmd(bytes) {
+  if (writeBusy) {
+    log('err', '正在写入，请稍等');
+    return;
+  }
+  if (!txChar || !device || !device.gatt || !device.gatt.connected) {
+    log('err', '当前未连接，尝试自动重连');
+    clearGattOnly();
+    setPanelConnected(false);
+    autoReconnect(device);
+    return;
+  }
+
+  try {
+    writeBusy = true;
+    const buf = new Uint8Array(bytes);
+    if (txChar.properties.writeWithoutResponse && txChar.writeValueWithoutResponse) {
+      await txChar.writeValueWithoutResponse(buf);
+    } else {
+      await txChar.writeValue(buf);
+    }
+    log('tx', '→ ' + logHex(bytes));
+  } catch (e) {
+    log('err', '发送失败: ' + e.message);
+    clearGattOnly();
+    setPanelConnected(false);
+    autoReconnect(device);
+  } finally {
+    writeBusy = false;
+  }
+}
+</script>
+</body>
+</html>
